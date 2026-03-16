@@ -1,0 +1,67 @@
+[package]
+name = "mnemonic"
+version = "2.0.2"
+edition = "2021"
+description = "Persistent memory for AI coding agents. Remembers what matters, forgets what doesn't."
+authors = ["Aamir Shahzad <aamir@aamirshahzad.uk>"]
+homepage = "https://aamirshahzad.uk"
+license = "Apache-2.0"
+repository = "https://github.com/Aamirofficiall/mnemonic"
+keywords = ["mcp", "memory", "ai", "agent", "knowledge-graph"]
+categories = ["development-tools", "database"]
+readme = "README.md"
+
+[[bin]]
+name = "mnemonic"
+path = "src/main.rs"
+
+[dependencies]
+# MCP server
+rmcp = { version = "0.16", features = ["server", "transport-io"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full", "io-std"] }
+
+# SQLite with bundled (includes FTS5 by default)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+
+# HTTP client for Gemini API (embeddings + fact extraction)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "1"
+
+# Logging (to stderr — stdout reserved for MCP JSON-RPC)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Config file parsing
+toml = "0.8"
+
+# Cloud sync (optional — only compiled with --features sync)
+aws-sdk-s3 = { version = "1", optional = true }
+aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
+
+[features]
+default = []
+sync = ["dep:aws-sdk-s3", "dep:aws-config"]
+
+[dev-dependencies]
+toml = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1

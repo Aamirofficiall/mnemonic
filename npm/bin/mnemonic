@@ -1,0 +1,40 @@
+#!/usr/bin/env node
+const { execFileSync } = require("child_process");
+const path = require("path");
+const fs = require("fs");
+
+const PLATFORM_MAP = {
+  "darwin-arm64": "mnemonic-darwin-arm64",
+  "darwin-x64": "mnemonic-darwin-x64",
+  "linux-x64": "mnemonic-linux-x64",
+  "linux-arm64": "mnemonic-linux-arm64",
+  "win32-x64": "mnemonic-win32-x64.exe",
+};
+
+const key = `${process.platform}-${process.arch}`;
+const bin = PLATFORM_MAP[key];
+
+if (!bin) {
+  console.error(`mnemonic: unsupported platform "${key}"`);
+  console.error(
+    `Supported: ${Object.keys(PLATFORM_MAP).join(", ")}`
+  );
+  process.exit(1);
+}
+
+const binPath = path.join(__dirname, "..", "binaries", bin);
+
+if (!fs.existsSync(binPath)) {
+  console.error(`mnemonic: binary not found for ${key}`);
+  console.error(`Expected at: ${binPath}`);
+  console.error(
+    `This platform may not have a pre-built binary yet.`
+  );
+  process.exit(1);
+}
+
+try {
+  execFileSync(binPath, process.argv.slice(2), { stdio: "inherit" });
+} catch (e) {
+  process.exit(e.status ?? 1);
+}

@@ -1,0 +1,30 @@
+{
+  "name": "mnemonic-ai",
+  "version": "2.0.2",
+  "description": "Persistent memory for AI coding agents. Remembers what matters, forgets what doesn't.",
+  "bin": {
+    "mnemonic": "bin/mnemonic"
+  },
+  "files": [
+    "bin/",
+    "binaries/",
+    "README.md"
+  ],
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["x64", "arm64"],
+  "engines": { "node": ">=16" },
+  "keywords": [
+    "mcp", "memory", "ai", "agent", "knowledge-graph",
+    "claude", "cursor", "coding-agent", "persistent-memory", "semantic-search"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Aamirofficiall/mnemonic"
+  },
+  "homepage": "https://github.com/Aamirofficiall/mnemonic#readme",
+  "bugs": {
+    "url": "https://github.com/Aamirofficiall/mnemonic/issues"
+  },
+  "author": "Aamir Shahzad"
+}
