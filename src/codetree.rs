@@ -449,57 +449,85 @@ pub fn build_dependencies(tags: &[Tag], store: &MemoryStore) -> Result<usize> {
     Ok(dep_count)
 }
 
-// ─── Render code map (compact tree format) ──────────────────────────────────
+// ─── Render code map with binary search token budget (Aider pattern) ────────
+
+fn render_n_files(files: &[CodeFile], store: &MemoryStore, n: usize) -> String {
+    let mut output = String::new();
+    for file in files.iter().take(n) {
+        let symbols = store.load_code_symbols(Some(&file.path));
+        let defs: Vec<String> = symbols.iter()
+            .filter(|s| s.kind != "call" && s.kind != "implementation")
+            .map(|s| {
+                if s.kind == "function" || s.kind == "method" {
+                    format!("{}()", s.name)
+                } else {
+                    s.name.clone()
+                }
+            })
+            .collect();
+        // Dedup consecutive identical names
+        let mut deduped: Vec<String> = Vec::new();
+        for d in &defs {
+            if deduped.last().map(|l| l != d).unwrap_or(true) {
+                deduped.push(d.clone());
+            }
+        }
+        if !deduped.is_empty() {
+            output.push_str(&format!("{}: {}\n", file.path, deduped.join(", ")));
+        } else {
+            output.push_str(&format!("{}\n", file.path));
+        }
+    }
+    output
+}
 
 pub fn render_codemap(store: &MemoryStore, file_filter: Option<&str>, budget_chars: usize) -> String {
     let files = store.load_code_files();
-    let mut output = String::new();
 
     if let Some(filter) = file_filter {
-        // Single file detail
-        let symbols = store.load_code_symbols(Some(filter));
+        // Single file — try exact, then suffix match
+        let mut symbols = store.load_code_symbols(Some(filter));
+        if symbols.is_empty() {
+            let all = store.load_code_symbols(None);
+            symbols = all.into_iter().filter(|s| s.file_path.ends_with(filter)).collect();
+        }
         if symbols.is_empty() {
             return format!("No symbols found for: {}", filter);
         }
-        output.push_str(&format!("{}:\n", filter));
+        let mut output = format!("{}:\n", filter);
         for sym in &symbols {
+            if sym.kind == "call" || sym.kind == "implementation" { continue; }
             output.push_str(&format!("  {} {} | {}\n", sym.kind, sym.name, sym.signature));
         }
-    } else {
-        // Full project map
-        for file in &files {
-            let symbols = store.load_code_symbols(Some(&file.path));
-            if symbols.is_empty() {
-                output.push_str(&format!("{}\n", file.path));
-            } else {
-                let sym_list: Vec<String> = symbols.iter()
-                    .filter(|s| s.kind != "call" && s.kind != "implementation")
-                    .map(|s| {
-                        if s.kind == "function" || s.kind == "method" {
-                            format!("{}()", s.name)
-                        } else {
-                            s.name.clone()
-                        }
-                    })
-                    .collect();
-                if !sym_list.is_empty() {
-                    output.push_str(&format!("{}: {}\n", file.path, sym_list.join(", ")));
-                } else {
-                    output.push_str(&format!("{}\n", file.path));
-                }
-            }
+        let (fc, sc, dc) = store.code_stats();
+        output.push_str(&format!("\n[{} files, {} symbols, {} deps]\n", fc, sc, dc));
+        return output;
+    }
 
-            // Budget check
-            if output.len() > budget_chars {
-                output.push_str(&format!("\n... truncated ({} files total)\n", files.len()));
-                break;
-            }
+    // Binary search: find max N files that fit within budget (Aider pattern)
+    let mut lo: usize = 1;
+    let mut hi: usize = files.len();
+    let mut best_output = render_n_files(&files, store, 1);
+
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let rendered = render_n_files(&files, store, mid);
+        if rendered.len() <= budget_chars {
+            best_output = rendered;
+            lo = mid + 1;
+        } else {
+            if mid == 0 { break; }
+            hi = mid - 1;
         }
     }
 
+    let shown = best_output.lines().count();
     let (fc, sc, dc) = store.code_stats();
-    output.push_str(&format!("\n[{} files, {} symbols, {} deps]\n", fc, sc, dc));
-    output
+    if shown < files.len() {
+        best_output.push_str(&format!("\n... ({}/{} files shown, budget: {} chars)\n", shown, fc, budget_chars));
+    }
+    best_output.push_str(&format!("[{} files, {} symbols, {} deps]\n", fc, sc, dc));
+    best_output
 }
 
 // ─── Render as JSON ─────────────────────────────────────────────────────────
@@ -533,13 +561,18 @@ pub fn render_codemap_json(store: &MemoryStore, file_filter: Option<&str>) -> se
 
 // ─── PageRank (simple power iteration) ──────────────────────────────────────
 
-pub fn compute_pagerank(store: &MemoryStore, damping: f64, iterations: usize) -> Result<usize> {
+pub fn compute_pagerank(store: &MemoryStore, damping: f64, iterations: usize, changed_files: Option<&[String]>) -> Result<usize> {
     let conn = store.conn_ref();
 
     // Get all files
     let mut stmt = conn.prepare("SELECT path FROM code_files").unwrap();
     let files: Vec<String> = stmt.query_map([], |r| r.get(0))
         .unwrap().filter_map(|r| r.ok()).collect();
+
+    // If only specific files changed, still compute full PageRank but log it
+    if let Some(changed) = changed_files {
+        debug!("PageRank: {} files changed, recomputing full graph ({} files)", changed.len(), files.len());
+    }
 
     if files.is_empty() { return Ok(0); }
 
@@ -768,8 +801,9 @@ pub fn index_project(root: &Path, store: &MemoryStore) -> Result<serde_json::Val
     // Build dependencies
     let dep_count = build_dependencies(&result.tags, store)?;
 
-    // Compute PageRank
-    let ranked = compute_pagerank(store, 0.85, 20)?;
+    // Compute PageRank (pass changed files for logging)
+    let changed: Vec<String> = result.files.iter().map(|f| f.path.clone()).collect();
+    let _ranked = compute_pagerank(store, 0.85, 20, if changed.is_empty() { None } else { Some(&changed) })?;
 
     // Link symbols to entity graph
     let linked = link_symbols_to_entities(store)?;

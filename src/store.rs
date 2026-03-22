@@ -739,10 +739,37 @@ impl MemoryStore {
                     .push(fact.content.clone());
             }
 
+            // Also include code dependencies if this is a file entity
+            let mut all_connected = connected_names;
+            let code_deps: Vec<String> = {
+                let conn = self.conn_ref();
+                let pattern = format!("%{}%", entity.name.to_lowercase());
+                let mut deps = Vec::new();
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT DISTINCT from_file FROM code_deps WHERE lower(to_file) LIKE ?1 LIMIT 10"
+                ) {
+                    deps.extend(stmt.query_map(params![pattern], |r| r.get::<_, String>(0))
+                        .unwrap_or_else(|_| panic!("query failed")).flatten());
+                }
+                let pattern2 = pattern.clone();
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT DISTINCT to_file FROM code_deps WHERE lower(from_file) LIKE ?1 LIMIT 10"
+                ) {
+                    deps.extend(stmt.query_map(params![pattern2], |r| r.get::<_, String>(0))
+                        .unwrap_or_else(|_| panic!("query failed")).flatten());
+                }
+                deps
+            };
+            for dep in code_deps {
+                if !all_connected.contains(&dep) {
+                    all_connected.push(dep);
+                }
+            }
+
             nodes.push(GraphNode {
                 entity,
                 facts,
-                connected_entities: connected_names,
+                connected_entities: all_connected,
                 relations,
             });
         }
@@ -780,7 +807,42 @@ impl MemoryStore {
             }
         }
 
-        // 2. Fall back to FTS for terms not in entity graph
+        // 2. Include matching code symbols
+        {
+            let code_results: Vec<SearchResult> = {
+                let conn = self.conn_ref();
+                let pattern = format!("%{}%", name.to_lowercase());
+                let mut out = Vec::new();
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT name, kind, signature, file_path, line_start FROM code_symbols WHERE lower(name) LIKE ?1 LIMIT 10"
+                ) {
+                    if let Ok(rows) = stmt.query_map(params![pattern], |row| {
+                        let sym_name: String = row.get(0)?;
+                        let kind: String = row.get(1)?;
+                        let sig: String = row.get(2)?;
+                        let file: String = row.get(3)?;
+                        let line: usize = row.get(4)?;
+                        Ok(SearchResult {
+                            result_type: "code_symbol".into(),
+                            id: format!("{}:{}:{}", file, sym_name, line),
+                            content: format!("[{}] {} ({}:{})", kind, sig, file, line),
+                            category: Some(kind.clone()),
+                            similarity: 0.90,
+                            metadata: Some(serde_json::json!({
+                                "file": file, "line": line, "kind": kind,
+                                "source": "codetree",
+                            })),
+                        })
+                    }) {
+                        out.extend(rows.flatten());
+                    }
+                }
+                out
+            };
+            results.extend(code_results);
+        }
+
+        // 3. Fall back to FTS for terms not in entity graph or code
         if results.is_empty() {
             let fts_results = self.fts_search(name, limit);
             results.extend(fts_results);
