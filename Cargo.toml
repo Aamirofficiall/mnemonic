@@ -1,19 +1,20 @@
 [package]
 name = "mnemonic"
-version = "2.0.2"
+version = "2.0.3"
 edition = "2021"
-description = "Persistent memory for AI coding agents. Remembers what matters, forgets what doesn't."
-authors = ["Aamir Shahzad <aamir@aamirshahzad.uk>"]
-homepage = "https://aamirshahzad.uk"
+description = "State-of-the-art memory engine for AI coding agents. Bi-temporal knowledge graph, RRF search, composite scoring, memory decay, entity resolution. CLI + MCP dual-mode."
 license = "Apache-2.0"
 repository = "https://github.com/Aamirofficiall/mnemonic"
-keywords = ["mcp", "memory", "ai", "agent", "knowledge-graph"]
+keywords = ["mcp", "memory", "ai", "agent", "embeddings"]
 categories = ["development-tools", "database"]
-readme = "README.md"
 
 [[bin]]
 name = "mnemonic"
 path = "src/main.rs"
+
+[lib]
+name = "mnemonic"
+path = "src/lib.rs"
 
 [dependencies]
 # MCP server
@@ -48,6 +49,21 @@ clap = { version = "4", features = ["derive"] }
 
 # Config file parsing
 toml = "0.8"
+
+# Code tree: tree-sitter parsing
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+npezza93-tree-sitter-swift = "0.4"
+sha2 = "0.10"
+
+# walkdir for recursive file scanning
+walkdir = "2"
+streaming-iterator = "0.1"
 
 # Cloud sync (optional — only compiled with --features sync)
 aws-sdk-s3 = { version = "1", optional = true }

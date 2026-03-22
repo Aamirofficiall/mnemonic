@@ -52,6 +52,10 @@ impl MemoryStore {
         Ok(store)
     }
 
+    pub fn conn_ref(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+        self.conn.lock().unwrap()
+    }
+
     fn create_tables(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
@@ -164,7 +168,42 @@ impl MemoryStore {
             CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
             CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
             CREATE INDEX IF NOT EXISTS idx_entity_edges_entity ON entity_edges(entity_id);
-            CREATE INDEX IF NOT EXISTS idx_entity_edges_fact ON entity_edges(fact_id);",
+            CREATE INDEX IF NOT EXISTS idx_entity_edges_fact ON entity_edges(fact_id);
+
+            CREATE TABLE IF NOT EXISTS code_files (
+                path TEXT PRIMARY KEY,
+                language TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                symbol_count INTEGER DEFAULT 0,
+                line_count INTEGER DEFAULT 0,
+                last_parsed TEXT,
+                pagerank REAL DEFAULT 0.0
+            );
+
+            CREATE TABLE IF NOT EXISTS code_symbols (
+                id TEXT PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                signature TEXT,
+                line_start INTEGER,
+                line_end INTEGER,
+                parent_symbol TEXT,
+                updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS code_deps (
+                from_file TEXT NOT NULL,
+                to_file TEXT NOT NULL,
+                symbol_name TEXT NOT NULL,
+                weight REAL DEFAULT 1.0,
+                PRIMARY KEY (from_file, to_file, symbol_name)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_code_symbols_file ON code_symbols(file_path);
+            CREATE INDEX IF NOT EXISTS idx_code_symbols_name ON code_symbols(name);
+            CREATE INDEX IF NOT EXISTS idx_code_deps_from ON code_deps(from_file);
+            CREATE INDEX IF NOT EXISTS idx_code_deps_to ON code_deps(to_file);",
         )?;
         Ok(())
     }

@@ -1,3 +1,4 @@
+mod codetree;
 mod config;
 mod embeddings;
 mod models;
@@ -148,6 +149,38 @@ enum Commands {
     },
     /// Observe tool call (reads JSON from stdin)
     Observe,
+
+    // ─── Code intelligence ──────────────────────────────────────────
+    /// Parse source code and build code tree (tree-sitter)
+    Codetree {
+        /// Source directory to parse
+        path: String,
+        /// Only re-parse changed files
+        #[arg(long)]
+        update: bool,
+    },
+    /// Generate token-budgeted code map
+    Codemap {
+        /// Source directory
+        path: String,
+        /// Token budget (chars, default 4096)
+        #[arg(long, default_value = "4096")]
+        budget: usize,
+        /// Output format: tree, json, xml
+        #[arg(long, default_value = "tree")]
+        format: String,
+        /// Show only one file
+        #[arg(long)]
+        file: Option<String>,
+        /// Drill into one symbol within a file (requires --file)
+        #[arg(long)]
+        symbol: Option<String>,
+    },
+    /// Show file dependency graph
+    Codedeps {
+        /// Source directory
+        path: String,
+    },
 }
 
 /// Shared runtime: config + store + embedder
@@ -241,6 +274,20 @@ async fn main() -> Result<()> {
         Commands::Observe => {
             let rt = Runtime::new()?;
             cmd_observe(&rt).await
+        }
+
+        // ─── Code intelligence ──────────────────────────────────────
+        Commands::Codetree { path, update: _ } => {
+            let rt = Runtime::new()?;
+            cmd_codetree(&rt, &path)
+        }
+        Commands::Codemap { path, budget, format, file, symbol } => {
+            let rt = Runtime::new()?;
+            cmd_codemap(&rt, &path, budget, &format, file.as_deref(), symbol.as_deref())
+        }
+        Commands::Codedeps { path } => {
+            let rt = Runtime::new()?;
+            cmd_codedeps(&rt, &path)
         }
     }
 }
@@ -510,6 +557,60 @@ async fn cmd_observe(rt: &Runtime) -> Result<()> {
     } else {
         eprintln!("Failed to parse hook event");
     }
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Code intelligence commands
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn cmd_codetree(rt: &Runtime, path: &str) -> Result<()> {
+    let root = std::path::Path::new(path).canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(path));
+    let result = codetree::index_project(&root, &rt.store)?;
+    println!("{}", result);
+    Ok(())
+}
+
+fn cmd_codemap(rt: &Runtime, _path: &str, budget: usize, format: &str, file: Option<&str>, symbol: Option<&str>) -> Result<()> {
+    // Symbol drill-down (requires --file)
+    if let (Some(f), Some(s)) = (file, symbol) {
+        let detail = codetree::render_symbol_detail(&rt.store, f, s);
+        print!("{}", detail);
+        return Ok(());
+    }
+
+    match format {
+        "json" => {
+            let json = codetree::render_codemap_json(&rt.store, file);
+            println!("{}", serde_json::to_string_pretty(&json)?);
+        }
+        "xml" => {
+            let xml = codetree::render_codemap_xml(&rt.store, file);
+            print!("{}", xml);
+        }
+        _ => {
+            let tree = codetree::render_codemap(&rt.store, file, budget);
+            print!("{}", tree);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_codedeps(rt: &Runtime, _path: &str) -> Result<()> {
+    let conn = rt.store.conn_ref();
+    let mut stmt = conn.prepare(
+        "SELECT from_file, to_file, symbol_name, weight FROM code_deps ORDER BY weight DESC LIMIT 50"
+    ).unwrap();
+    let deps: Vec<(String, String, String, f64)> = stmt.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    }).unwrap().filter_map(|r| r.ok()).collect();
+
+    for (from, to, sym, weight) in &deps {
+        println!("{} -> {} [{}] (w={:.1})", from, to, sym, weight);
+    }
+    let (fc, sc, dc) = rt.store.code_stats();
+    println!("\n[{} files, {} symbols, {} deps]", fc, sc, dc);
     Ok(())
 }
 
