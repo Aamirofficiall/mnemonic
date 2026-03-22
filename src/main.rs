@@ -181,6 +181,26 @@ enum Commands {
         /// Source directory
         path: String,
     },
+    /// Auto-surface memories + code symbols for a file (use before editing)
+    ContextFor {
+        /// File path (e.g. comp_renderer.cpp or src/main.rs)
+        file: String,
+    },
+    /// Learn a pattern (alias for save with --cat pattern)
+    Learn {
+        /// What you learned
+        content: String,
+        /// Category (default: pattern)
+        #[arg(long, short = 'c', default_value = "pattern")]
+        cat: String,
+        /// TTL (default: 30d)
+        #[arg(long, default_value = "30d")]
+        ttl: String,
+    },
+    /// Export all memories as JSON
+    Export,
+    /// Import memories from JSON (stdin)
+    Import,
 }
 
 /// Shared runtime: config + store + embedder
@@ -288,6 +308,22 @@ async fn main() -> Result<()> {
         Commands::Codedeps { path } => {
             let rt = Runtime::new()?;
             cmd_codedeps(&rt, &path)
+        }
+        Commands::ContextFor { file } => {
+            let rt = Runtime::new()?;
+            cmd_context_for(&rt, &file)
+        }
+        Commands::Learn { content, cat, ttl } => {
+            let rt = Runtime::new()?;
+            cmd_save(&rt, &content, &cat, false, Some(&ttl), None, None).await
+        }
+        Commands::Export => {
+            let rt = Runtime::new()?;
+            cmd_export(&rt)
+        }
+        Commands::Import => {
+            let rt = Runtime::new()?;
+            cmd_import(&rt)
         }
     }
 }
@@ -611,6 +647,179 @@ fn cmd_codedeps(rt: &Runtime, _path: &str) -> Result<()> {
     }
     let (fc, sc, dc) = rt.store.code_stats();
     println!("\n[{} files, {} symbols, {} deps]", fc, sc, dc);
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Context-for: auto-surface memories + code for a file
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn cmd_context_for(rt: &Runtime, file: &str) -> Result<()> {
+    let filename = std::path::Path::new(file)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| file.to_string());
+
+    let mut out = String::new();
+    out.push_str(&format!("# Context for: {}\n\n", file));
+
+    // 1. Code symbols in this file
+    let symbols = rt.store.load_code_symbols(Some(file));
+    let symbols = if symbols.is_empty() {
+        // Try suffix match
+        rt.store.load_code_symbols(None).into_iter()
+            .filter(|s| s.file_path.ends_with(&filename))
+            .collect::<Vec<_>>()
+    } else {
+        symbols
+    };
+
+    if !symbols.is_empty() {
+        out.push_str("## Code Structure\n");
+        for sym in &symbols {
+            if sym.kind == "call" || sym.kind == "implementation" { continue; }
+            out.push_str(&format!("  {} {} | {}\n", sym.kind, sym.name, sym.signature));
+        }
+        out.push('\n');
+    }
+
+    // 2. Memory facts about this file (entity search — FTS only, no Gemini)
+    let entity_results = rt.store.fts_search(&filename, 10);
+    let relevant: Vec<_> = entity_results.iter()
+        .filter(|r| r.result_type == "fact")
+        .collect();
+
+    if !relevant.is_empty() {
+        out.push_str("## Related Memories\n");
+        for fact in &relevant {
+            let pinned = fact.metadata.as_ref()
+                .and_then(|m| m.get("pinned"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let prefix = if pinned { "[pinned] " } else { "" };
+            out.push_str(&format!("  {}{}\n", prefix, fact.content.chars().take(120).collect::<String>()));
+        }
+        out.push('\n');
+    }
+
+    // 3. File dependencies (what this file depends on / depended by)
+    {
+        let conn = rt.store.conn_ref();
+        let pattern = format!("%{}%", filename.to_lowercase());
+
+        let deps_out: Vec<String> = conn
+            .prepare("SELECT DISTINCT to_file FROM code_deps WHERE lower(from_file) LIKE ?1 LIMIT 10")
+            .ok()
+            .map(|mut stmt| stmt.query_map(rusqlite::params![pattern], |r| r.get::<_, String>(0))
+                .unwrap_or_else(|_| panic!("")).flatten().collect())
+            .unwrap_or_default();
+
+        let deps_in: Vec<String> = conn
+            .prepare("SELECT DISTINCT from_file FROM code_deps WHERE lower(to_file) LIKE ?1 LIMIT 10")
+            .ok()
+            .map(|mut stmt| stmt.query_map(rusqlite::params![pattern], |r| r.get::<_, String>(0))
+                .unwrap_or_else(|_| panic!("")).flatten().collect())
+            .unwrap_or_default();
+
+        if !deps_out.is_empty() || !deps_in.is_empty() {
+            out.push_str("## Dependencies\n");
+            if !deps_out.is_empty() {
+                out.push_str(&format!("  imports: {}\n", deps_out.join(", ")));
+            }
+            if !deps_in.is_empty() {
+                out.push_str(&format!("  used_by: {}\n", deps_in.join(", ")));
+            }
+            out.push('\n');
+        }
+    }
+
+    // 4. Pinned gotchas (always show pinned facts that mention this file or key terms)
+    let pinned = rt.store.load_pinned_facts(None, 50);
+    let file_pinned: Vec<_> = pinned.iter()
+        .filter(|f| {
+            let lower = f.content.to_lowercase();
+            lower.contains(&filename.to_lowercase()) ||
+            symbols.iter().any(|s| lower.contains(&s.name.to_lowercase()) && s.name.len() > 5)
+        })
+        .collect();
+
+    if !file_pinned.is_empty() && relevant.is_empty() {
+        out.push_str("## Pinned Gotchas\n");
+        for fact in &file_pinned {
+            out.push_str(&format!("  [{}] {}\n", fact.category, fact.content.chars().take(120).collect::<String>()));
+        }
+        out.push('\n');
+    }
+
+    if out.lines().count() <= 2 {
+        out.push_str("No memories or code symbols found for this file.\n");
+        out.push_str("Run `mnemonic codetree <src-dir>` first to index the codebase.\n");
+    }
+
+    print!("{}", out);
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Export / Import
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn cmd_export(rt: &Runtime) -> Result<()> {
+    let facts = rt.store.load_active_facts();
+    let export: Vec<serde_json::Value> = facts.iter().map(|f| {
+        serde_json::json!({
+            "content": f.content,
+            "category": f.category,
+            "confidence": f.confidence,
+            "pinned": f.pinned,
+            "importance": f.importance,
+            "created_at": f.created_at,
+            "ttl": f.ttl,
+        })
+    }).collect();
+    println!("{}", serde_json::to_string_pretty(&export)?);
+    Ok(())
+}
+
+fn cmd_import(rt: &Runtime) -> Result<()> {
+    use std::io::Read;
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+    let facts: Vec<serde_json::Value> = serde_json::from_str(&input)?;
+
+    let mut imported = 0;
+    for f in &facts {
+        let content = f["content"].as_str().unwrap_or("");
+        let category = f["category"].as_str().unwrap_or("insight");
+        let pinned = f["pinned"].as_bool().unwrap_or(false);
+        let importance = f["importance"].as_f64().unwrap_or(0.5);
+
+        if content.is_empty() { continue; }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let fact = models::MemoryFact {
+            id: format!("fact_{}", &uuid::Uuid::new_v4().to_string()[..8]),
+            content: content.to_string(),
+            category: category.to_string(),
+            confidence: f["confidence"].as_f64().unwrap_or(0.9),
+            created_at: f["created_at"].as_str().unwrap_or(&now).to_string(),
+            updated_at: now.clone(),
+            valid_at: None,
+            invalid_at: None,
+            source: "import".to_string(),
+            expires_at: None,
+            pinned,
+            importance,
+            access_count: 0,
+            superseded_by: None,
+            ttl: f["ttl"].as_str().map(|s| s.to_string()),
+            session_id: None,
+            embedding: None,
+        };
+        rt.store.insert_fact(&fact)?;
+        imported += 1;
+    }
+    println!("{{\"imported\": {}}}", imported);
     Ok(())
 }
 
