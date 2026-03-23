@@ -201,6 +201,30 @@ enum Commands {
     Export,
     /// Import memories from JSON (stdin)
     Import,
+    /// Show what calls a function (live AST walk)
+    Callers {
+        /// Function/symbol name
+        name: String,
+        /// Source directory to scan
+        #[arg(long, default_value = "src")]
+        src: String,
+    },
+    /// Show what a function calls (live AST walk)
+    Callees {
+        /// Function/symbol name
+        name: String,
+        /// Source directory to scan
+        #[arg(long, default_value = "src")]
+        src: String,
+    },
+    /// Find all functions that reference a symbol/variable (live AST walk)
+    References {
+        /// Symbol or variable name to find
+        name: String,
+        /// Source directory to scan
+        #[arg(long, default_value = "src")]
+        src: String,
+    },
 }
 
 /// Shared runtime: config + store + embedder
@@ -324,6 +348,18 @@ async fn main() -> Result<()> {
         Commands::Import => {
             let rt = Runtime::new()?;
             cmd_import(&rt)
+        }
+        Commands::Callers { name, src } => {
+            let rt = Runtime::new()?;
+            cmd_callers(&rt, &name, &src)
+        }
+        Commands::Callees { name, src } => {
+            let rt = Runtime::new()?;
+            cmd_callees(&rt, &name, &src)
+        }
+        Commands::References { name, src } => {
+            let rt = Runtime::new()?;
+            cmd_references(&rt, &name, &src)
         }
     }
 }
@@ -649,6 +685,106 @@ fn cmd_codedeps(rt: &Runtime, _path: &str) -> Result<()> {
     println!("\n[{} files, {} symbols, {} deps]", fc, sc, dc);
     Ok(())
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Callers / Callees / References
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn cmd_callers(_rt: &Runtime, name: &str, src: &str) -> Result<()> {
+    let src_dir = PathBuf::from(src).canonicalize().unwrap_or_else(|_| PathBuf::from(src));
+    let t0 = std::time::Instant::now();
+
+    let results = codetree::find_callers(name, &src_dir)?;
+
+    println!("# Callers of '{}' (live AST, {}ms)", name, t0.elapsed().as_millis());
+    if results.is_empty() {
+        println!("  No callers found.");
+    } else {
+        for r in &results {
+            println!("  {}:{} in {}()", r.file, r.line + 1, r.function);
+        }
+    }
+    println!("\n[{} callers]", results.len());
+    Ok(())
+}
+
+fn cmd_callees(rt: &Runtime, name: &str, src: &str) -> Result<()> {
+    let src_dir = PathBuf::from(src).canonicalize().unwrap_or_else(|_| PathBuf::from(src));
+    let t0 = std::time::Instant::now();
+
+    let results = codetree::find_callees(name, &src_dir, &rt.store)?;
+
+    println!("# Callees of '{}' (live AST, {}ms)", name, t0.elapsed().as_millis());
+    if results.is_empty() {
+        println!("  No callees found. Is '{}' in the codetree?", name);
+    } else {
+        for r in &results {
+            println!("  {}:{} calls {}()", r.file, r.line + 1, r.function);
+        }
+    }
+    println!("\n[{} callees]", results.len());
+    Ok(())
+}
+
+fn cmd_references(rt: &Runtime, name: &str, src: &str) -> Result<()> {
+    let src_dir = PathBuf::from(src).canonicalize().unwrap_or_else(|_| PathBuf::from(src));
+    let t0 = std::time::Instant::now();
+
+    let results = codetree::find_references(name, &src_dir)?;
+
+    println!("# References to '{}' (live AST, {}ms)", name, t0.elapsed().as_millis());
+    if results.is_empty() {
+        println!("  No references found.");
+    } else {
+        // Group by file
+        let mut by_file: std::collections::HashMap<String, Vec<&codetree::CodeRef>> = std::collections::HashMap::new();
+        for r in &results {
+            by_file.entry(r.file.clone()).or_default().push(r);
+        }
+        for (file, refs) in &by_file {
+            println!("  {}:", file);
+            for r in refs {
+                println!("    :{} in {}()", r.line + 1, r.function);
+            }
+        }
+    }
+
+    // Also show related memory facts
+    let facts = rt.store.fts_search(name, 3);
+    let relevant: Vec<_> = facts.iter().filter(|f| f.result_type == "fact").collect();
+    if !relevant.is_empty() {
+        println!("\n  ## Related memories");
+        for fact in &relevant {
+            println!("    {}", fact.content.chars().take(100).collect::<String>());
+        }
+    }
+
+    println!("\n[{} references, {} memories]", results.len(), relevant.len());
+    Ok(())
+}
+
+/// Find the source directory from the codetree DB (first indexed file's parent)
+fn find_src_dir(rt: &Runtime) -> Result<PathBuf> {
+    let files = rt.store.load_code_files();
+    if let Some(first) = files.first() {
+        // Walk up from the first file's path to find a directory that exists
+        let path = PathBuf::from(&first.path);
+        // Try common source roots
+        for candidate in &["/workspace/cinematic-engine/src", "src", "."] {
+            let p = PathBuf::from(candidate);
+            if p.exists() { return Ok(p.canonicalize()?); }
+        }
+        // Try the file's directory
+        if let Some(parent) = path.parent() {
+            let p = PathBuf::from(parent);
+            if p.exists() { return Ok(p.canonicalize()?); }
+        }
+    }
+    // Fallback to current dir
+    Ok(std::env::current_dir()?)
+}
+
+use std::path::PathBuf;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Context-for: auto-surface memories + code for a file

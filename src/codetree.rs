@@ -820,3 +820,286 @@ pub fn index_project(root: &Path, store: &MemoryStore) -> Result<serde_json::Val
         "time_ms": elapsed,
     }))
 }
+
+// ─── Live AST walking: callers, callees, references ─────────────────────────
+// No DB storage — parse on-demand, always accurate.
+
+/// Walk a tree-sitter node recursively, collecting all call expressions
+fn collect_calls(node: tree_sitter::Node, source: &[u8], calls: &mut Vec<(String, usize)>) {
+    // Check if this node is a call expression
+    let kind = node.kind();
+    if kind == "call_expression" || kind == "macro_invocation" {
+        // Get the function name from the first child
+        if let Some(func_node) = node.child_by_field_name("function")
+            .or_else(|| node.child_by_field_name("macro"))
+            .or_else(|| node.child(0))
+        {
+            let name = extract_call_name(func_node, source);
+            if !name.is_empty() && name.len() < 100 {
+                calls.push((name, node.start_position().row));
+            }
+        }
+    }
+
+    // Recurse into children
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_calls(child, source, calls);
+    }
+}
+
+/// Extract the name from a call expression's function node
+fn extract_call_name(node: tree_sitter::Node, source: &[u8]) -> String {
+    match node.kind() {
+        "identifier" | "field_identifier" | "property_identifier" | "simple_identifier" => {
+            node.utf8_text(source).unwrap_or("").to_string()
+        }
+        "field_expression" | "member_expression" => {
+            // foo.bar() → extract "bar"
+            if let Some(field) = node.child_by_field_name("field")
+                .or_else(|| node.child_by_field_name("property"))
+            {
+                field.utf8_text(source).unwrap_or("").to_string()
+            } else {
+                node.utf8_text(source).unwrap_or("").to_string()
+            }
+        }
+        "scoped_identifier" | "qualified_identifier" => {
+            // namespace::func → extract "func" (last component)
+            if let Some(name) = node.child_by_field_name("name") {
+                name.utf8_text(source).unwrap_or("").to_string()
+            } else {
+                let text = node.utf8_text(source).unwrap_or("");
+                text.rsplit("::").next().unwrap_or(text).to_string()
+            }
+        }
+        "attribute" => {
+            // Python: obj.method() → extract "method"
+            if let Some(attr) = node.child_by_field_name("attribute") {
+                attr.utf8_text(source).unwrap_or("").to_string()
+            } else {
+                node.utf8_text(source).unwrap_or("").to_string()
+            }
+        }
+        _ => {
+            // Fallback: try to get text directly
+            let text = node.utf8_text(source).unwrap_or("");
+            if text.len() < 60 { text.to_string() } else { String::new() }
+        }
+    }
+}
+
+/// Walk a tree-sitter node recursively, collecting all identifier references
+fn collect_identifiers(node: tree_sitter::Node, source: &[u8], ids: &mut Vec<(String, usize)>) {
+    let kind = node.kind();
+    if kind == "identifier" || kind == "field_identifier" || kind == "type_identifier" {
+        let name = node.utf8_text(source).unwrap_or("").to_string();
+        if !name.is_empty() && name.len() > 2 && name.len() < 100 {
+            ids.push((name, node.start_position().row));
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_identifiers(child, source, ids);
+    }
+}
+
+/// Find the function body node for a given function name in a parsed tree
+fn find_function_body<'a>(node: tree_sitter::Node<'a>, name: &str, source: &[u8]) -> Option<tree_sitter::Node<'a>> {
+    let kind = node.kind();
+    let is_func = kind.contains("function") || kind.contains("method") || kind == "declaration_list";
+
+    if is_func {
+        // Check if this function's name matches
+        if let Some(name_node) = node.child_by_field_name("name")
+            .or_else(|| node.child_by_field_name("declarator"))
+        {
+            let func_name = name_node.utf8_text(source).unwrap_or("");
+            // Handle qualified names: Foo::bar → check "bar"
+            let short_name = func_name.rsplit("::").next().unwrap_or(func_name);
+            if short_name == name {
+                // Return the body
+                return node.child_by_field_name("body");
+            }
+        }
+    }
+
+    // Recurse
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(body) = find_function_body(child, name, source) {
+            return Some(body);
+        }
+    }
+    None
+}
+
+/// Result of a caller/callee/reference query
+#[derive(Debug, serde::Serialize)]
+pub struct CodeRef {
+    pub file: String,
+    pub function: String,
+    pub line: usize,
+    pub kind: String, // "caller", "callee", "reference"
+}
+
+/// Find all callers of a function across all source files
+pub fn find_callers(target_name: &str, src_dir: &Path) -> Result<Vec<CodeRef>> {
+    let files = scan_directory(src_dir)?;
+    let mut results = Vec::new();
+
+    for (path, lang) in &files {
+        let ts_lang = match get_ts_language(lang) { Some(l) => l, None => continue };
+        let source = match std::fs::read_to_string(path) { Ok(s) => s, Err(_) => continue };
+
+        let mut parser = tree_sitter::Parser::new();
+        if parser.set_language(&ts_lang).is_err() { continue; }
+        let tree = match parser.parse(&source, None) { Some(t) => t, None => continue };
+
+        let rel_path = path.strip_prefix(src_dir).unwrap_or(path).to_string_lossy().to_string();
+
+        // Walk entire file for call expressions
+        let mut calls = Vec::new();
+        collect_calls(tree.root_node(), source.as_bytes(), &mut calls);
+
+        // Find calls that match our target
+        for (call_name, line) in &calls {
+            if call_name == target_name {
+                // Find which function contains this line
+                let containing_fn = find_containing_function(tree.root_node(), *line, source.as_bytes())
+                    .unwrap_or_else(|| "top-level".to_string());
+                results.push(CodeRef {
+                    file: rel_path.clone(),
+                    function: containing_fn,
+                    line: *line,
+                    kind: "caller".to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Find all callees of a specific function
+pub fn find_callees(func_name: &str, src_dir: &Path, store: &MemoryStore) -> Result<Vec<CodeRef>> {
+    // Find which file defines this function
+    let symbols = store.load_code_symbols(None);
+    let def = symbols.iter().find(|s| s.name == func_name && s.kind != "call");
+
+    let file_path = match def {
+        Some(s) => {
+            // Reconstruct full path
+            let candidate = src_dir.join(&s.file_path);
+            if candidate.exists() {
+                candidate
+            } else {
+                // Try finding by filename
+                let fname = Path::new(&s.file_path).file_name().unwrap_or_default();
+                scan_directory(src_dir)?.into_iter()
+                    .find(|(p, _)| p.file_name() == Some(fname))
+                    .map(|(p, _)| p)
+                    .unwrap_or(candidate)
+            }
+        }
+        None => return Ok(vec![]),
+    };
+
+    let lang = match detect_language(&file_path) { Some(l) => l, None => return Ok(vec![]) };
+    let ts_lang = match get_ts_language(lang) { Some(l) => l, None => return Ok(vec![]) };
+    let source = std::fs::read_to_string(&file_path)?;
+    let rel_path = file_path.strip_prefix(src_dir).unwrap_or(&file_path).to_string_lossy().to_string();
+
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&ts_lang)?;
+    let tree = parser.parse(&source, None).ok_or_else(|| anyhow!("parse failed"))?;
+
+    // Find the function body
+    let body = match find_function_body(tree.root_node(), func_name, source.as_bytes()) {
+        Some(b) => b,
+        None => return Ok(vec![]),
+    };
+
+    // Collect all calls within the body
+    let mut calls = Vec::new();
+    collect_calls(body, source.as_bytes(), &mut calls);
+
+    // Dedup by name
+    let mut seen = std::collections::HashSet::new();
+    let mut results = Vec::new();
+    for (call_name, line) in calls {
+        if seen.insert(call_name.clone()) {
+            results.push(CodeRef {
+                file: rel_path.clone(),
+                function: call_name,
+                line,
+                kind: "callee".to_string(),
+            });
+        }
+    }
+
+    Ok(results)
+}
+
+/// Find all references to a symbol across all source files
+pub fn find_references(target_name: &str, src_dir: &Path) -> Result<Vec<CodeRef>> {
+    let files = scan_directory(src_dir)?;
+    let mut results = Vec::new();
+
+    for (path, lang) in &files {
+        let ts_lang = match get_ts_language(lang) { Some(l) => l, None => continue };
+        let source = match std::fs::read_to_string(path) { Ok(s) => s, Err(_) => continue };
+
+        let mut parser = tree_sitter::Parser::new();
+        if parser.set_language(&ts_lang).is_err() { continue; }
+        let tree = match parser.parse(&source, None) { Some(t) => t, None => continue };
+
+        let rel_path = path.strip_prefix(src_dir).unwrap_or(path).to_string_lossy().to_string();
+
+        let mut ids = Vec::new();
+        collect_identifiers(tree.root_node(), source.as_bytes(), &mut ids);
+
+        let mut seen_lines = std::collections::HashSet::new();
+        for (id_name, line) in &ids {
+            if id_name == target_name && seen_lines.insert(*line) {
+                let containing_fn = find_containing_function(tree.root_node(), *line, source.as_bytes())
+                    .unwrap_or_else(|| "top-level".to_string());
+                results.push(CodeRef {
+                    file: rel_path.clone(),
+                    function: containing_fn,
+                    line: *line,
+                    kind: "reference".to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Find which function contains a given line number
+fn find_containing_function(node: tree_sitter::Node, target_line: usize, source: &[u8]) -> Option<String> {
+    let kind = node.kind();
+    let is_func = kind.contains("function_definition") || kind.contains("function_item")
+        || kind.contains("function_declaration") || kind.contains("method_definition");
+
+    if is_func && node.start_position().row <= target_line && node.end_position().row >= target_line {
+        if let Some(name_node) = node.child_by_field_name("name")
+            .or_else(|| node.child_by_field_name("declarator"))
+        {
+            let name = name_node.utf8_text(source).unwrap_or("").to_string();
+            let short = name.rsplit("::").next().unwrap_or(&name).to_string();
+            if !short.is_empty() {
+                return Some(short);
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(name) = find_containing_function(child, target_line, source) {
+            return Some(name);
+        }
+    }
+    None
+}
